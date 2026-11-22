@@ -7,10 +7,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from catalog import initialize_trials, register
-from observations import LiveCircuit, PipeSegment, ingest, initialize_revisions
+from observations import LiveCircuit, PipeSegment, ingest, ingest_bounds, initialize_revisions
 from receipt import initialize_receipts, receive
-from report import initialize_decisions, read, sign
+from report import initialize_decisions, read, sign, sign_bounds
 from station import initialize_issuance, issue
+from station.decode import decode_any
 
 ROUND = 'bend-01'
 ROSTERS = {'north': ('P', 'A', 'B'), 'south': ('A', 'B')}
@@ -33,6 +34,21 @@ NORTH_CORRECTED = (
 SOUTH_PIPES = (PipeSegment('link', 'A', 'B'),)
 SOUTH_CIRCUITS = (LiveCircuit('south-open', ('link',), '1/4'), LiveCircuit('south-closed', (), '3/4'))
 
+BOUNDS_ROUND = 'bounds-demo-01'
+BOUNDS_ROSTERS = {'north': ('P', 'A', 'B'), 'south': ('P', 'A', 'B')}
+BOUNDS_NORTH_PIPES = (
+    PipeSegment('feed', 'P', 'north-private'),
+    PipeSegment('pa', 'north-private', 'A'),
+    PipeSegment('pb', 'P', 'B'),
+)
+BOUNDS_SOUTH_PIPES = (PipeSegment('pa', 'P', 'A'), PipeSegment('pb', 'P', 'B'))
+BOUNDS_NORTH = (
+    ('a-first', ('feed', 'pa'), '1/4', '1/2'),
+    ('a-second', ('feed', 'pa'), '1/4', '1/2'),
+    ('b', ('pb',), 0, '1/2'),
+)
+BOUNDS_SOUTH = (LiveCircuit('b', ('pb',), 1),)
+
 
 def seed_sample(trials: sqlite3.Connection, source: sqlite3.Connection, round_id: str = ROUND):
     register(trials, round_id, ROSTERS)
@@ -49,6 +65,75 @@ def _expected_parents(pieces, receipt_ids):
 def _observed_parents(decision):
     return [(parent.receipt_id, parent.issuance_id, parent.station, parent.revision_id)
             for parent in decision.parents]
+
+
+def run_bounds_demo(directory) -> int:
+    """Issue interval pieces, take them offline, then sign and reopen by id."""
+    root = Path(directory)
+    source_path, center_path = root / 'bounds-source.sqlite3', root / 'bounds-center.sqlite3'
+    with closing(sqlite3.connect(root / 'bounds-trials.sqlite3')) as trials:
+        initialize_trials(trials)
+        with closing(sqlite3.connect(source_path)) as source:
+            initialize_revisions(source)
+            initialize_issuance(source)
+            register(trials, BOUNDS_ROUND, BOUNDS_ROSTERS)
+            north = ingest_bounds(
+                trials, source, BOUNDS_ROUND, 'north', BOUNDS_NORTH_PIPES, BOUNDS_NORTH,
+            )
+            south = ingest(
+                trials, source, BOUNDS_ROUND, 'south', BOUNDS_SOUTH_PIPES, BOUNDS_SOUTH,
+            )
+            north_piece = issue(trials, source, BOUNDS_ROUND, 'north', north.revision_id)
+            south_piece = issue(trials, source, BOUNDS_ROUND, 'south', south.revision_id)
+            assert decode_any(north_piece.payload).issuance_id.startswith('v2-')
+
+        # Source shut: the night shift only holds the roster and the offline pieces.
+        with closing(sqlite3.connect(center_path)) as center:
+            initialize_receipts(center)
+            initialize_decisions(center)
+            north_id = receive(trials, center, north_piece.payload)
+            south_id = receive(trials, center, south_piece.payload)
+            # Re-delivering the same piece returns the original receipt number.
+            assert receive(trials, center, north_piece.payload) == north_id
+            signed = sign_bounds(
+                trials, center, (north_id, south_id), 'P', ('A', 'B'), '3/4',
+            )
+
+    with closing(sqlite3.connect(center_path)) as center:
+        initialize_receipts(center)
+        initialize_decisions(center)
+        decision, receipt = read(center, signed[0].report_id)
+
+    if (decision.lower, decision.upper, decision.verdict) != (
+        Fraction(1, 2), Fraction(1), 'retest',
+    ):
+        print('BOUNDS_DECISION_MISMATCH', file=sys.stderr)
+        return 1
+    print(
+        f'Bounds report {decision.report_id}: [{decision.lower}, {decision.upper}] '
+        f'{decision.verdict} (success receipt {receipt.success_id}, station receipts '
+        f'{decision.parents[0].receipt_id}/{decision.parents[1].receipt_id})'
+    )
+    print('BOUNDS_SCENARIO ' + json.dumps({
+        'case_id': 'bounds-merged',
+        'input': {
+            'entry': 'P', 'targets': ['A', 'B'], 'threshold': '3/4',
+            'north_intervals': {'a-first': ['1/4', '1/2'],
+                                'a-second': ['1/4', '1/2'], 'b': ['0', '1/2']},
+            'south_point': {'b': '1'},
+        },
+        'actual': {'lower': str(decision.lower), 'upper': str(decision.upper),
+                   'verdict': decision.verdict},
+        'lower_witness': [
+            [[list(blocks), str(mass)] for blocks, mass in station]
+            for station in decision.lower_witness
+        ],
+        'upper_witness': [
+            [[list(blocks), str(mass)] for blocks, mass in station]
+            for station in decision.upper_witness
+        ],
+    }, sort_keys=True))
+    return 0
 
 
 def main() -> int:
@@ -133,6 +218,8 @@ def main() -> int:
                       'the all-connected state contributes 1/4 and the two one-branch states '
                       'contribute 1/16 each through the southern link.',
         }, sort_keys=True))
+        if run_bounds_demo(directory):
+            return 1
     return 0
 
 

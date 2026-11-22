@@ -3,10 +3,13 @@ import sqlite3
 from contextlib import closing
 from fractions import Fraction
 from catalog import initialize_trials, register
-from observations import LiveCircuit, PipeSegment, ingest, initialize_revisions
+from observations import LiveCircuit, PipeSegment, ingest, ingest_bounds, initialize_revisions
 from receipt import initialize_receipts, receive
-from report import initialize_decisions, read, sign
+from report import initialize_decisions, read, sign, sign_bounds
+from report.bounds import back_substitute
+from receipt.intake import load_receipt
 from station import initialize_issuance, issue
+from station.decode import decode_any
 
 ROUND = "bounds-01"
 ENTRY = "P"
@@ -48,6 +51,36 @@ EXAMPLES = (
 )
 
 
+def _issue_bounds_case(trials, source, center, name, north_circuits, south_circuits):
+    north = ingest_bounds(trials, source, ROUND, "north", NORTH_PIPES, north_circuits)
+    if south_circuits and isinstance(south_circuits[0], LiveCircuit):
+        south = ingest(trials, source, ROUND, "south", SOUTH_PIPES, south_circuits)
+    else:
+        south = ingest_bounds(trials, source, ROUND, "south", SOUTH_PIPES, south_circuits)
+    pieces = tuple(
+        issue(trials, source, ROUND, revision.station, revision.revision_id)
+        for revision in (north, south)
+    )
+    ids = tuple(receive(trials, center, piece.payload) for piece in pieces)
+    return pieces, ids
+
+
+def _check_witness_feasibility(pieces, decision):
+    for index, piece in enumerate(pieces):
+        decoded = decode_any(piece.payload)
+        for witness in (decision.lower_witness, decision.upper_witness):
+            masses = dict(witness[index])
+            if sum(masses.values()) != 1:
+                raise ValueError(f"witness masses for {piece.station} do not sum to one")
+            for row in decoded.rows:
+                mass = masses.get(row.blocks, Fraction(0))
+                if hasattr(row, "lower"):
+                    if not row.lower <= mass <= row.upper:
+                        raise ValueError("witness mass leaves the partition interval")
+                elif mass != row.mass:
+                    raise ValueError("witness mass does not match the point-weight piece")
+
+
 def main() -> int:
     with closing(sqlite3.connect(":memory:")) as trials, closing(sqlite3.connect(":memory:")) as center:
         initialize_trials(trials)
@@ -70,7 +103,49 @@ def main() -> int:
         if read(center, decision.report_id) != signed:
             print("V1 nominal report cannot be collected", file=sys.stderr)
             return 1
-    print(f"V1 nominal: {decision.probability} {decision.verdict}")
+        print(f"V1 nominal: {decision.probability} {decision.verdict}")
+
+        with closing(sqlite3.connect(":memory:")) as source:
+            initialize_revisions(source)
+            initialize_issuance(source)
+            for name, north_circuits, south_circuits, threshold, expected, expected_verdict in EXAMPLES:
+                case_pieces, case_ids = _issue_bounds_case(
+                    trials, source, center, name, north_circuits, south_circuits,
+                )
+                bounds_signed = sign_bounds(
+                    trials, center, case_ids, ENTRY, TARGETS, threshold,
+                )
+                bounds_decision, bounds_receipt = bounds_signed
+                actual = (bounds_decision.lower, bounds_decision.upper)
+                if actual != expected or bounds_decision.verdict != expected_verdict:
+                    print(
+                        f"BOUNDS_MISMATCH {name} expected={expected} {expected_verdict} "
+                        f"actual={actual} {bounds_decision.verdict}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                pair = type(
+                    "Pair", (),
+                    {"first": load_receipt(center, case_ids[0]),
+                     "second": load_receipt(center, case_ids[1])},
+                )()
+                if back_substitute(pair, bounds_decision.request,
+                                   bounds_decision.lower_witness) != bounds_decision.lower:
+                    print(f"BOUNDS_WITNESS_MISMATCH {name} lower", file=sys.stderr)
+                    return 1
+                if back_substitute(pair, bounds_decision.request,
+                                   bounds_decision.upper_witness) != bounds_decision.upper:
+                    print(f"BOUNDS_WITNESS_MISMATCH {name} upper", file=sys.stderr)
+                    return 1
+                _check_witness_feasibility(case_pieces, bounds_decision)
+                if read(center, bounds_decision.report_id) != bounds_signed:
+                    print(f"BOUNDS report {name} cannot be collected", file=sys.stderr)
+                    return 1
+                print(
+                    f"bounds {name}: [{bounds_decision.lower}, {bounds_decision.upper}] "
+                    f"{bounds_decision.verdict} (report {bounds_decision.report_id}, "
+                    f"receipt {bounds_receipt.success_id})"
+                )
     return 0
 
 

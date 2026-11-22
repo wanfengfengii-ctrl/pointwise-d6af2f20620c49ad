@@ -19,10 +19,16 @@ class LiveCircuit:
     mass: Fraction | int | str
 
 
-def validate_circuits(
-    segments: Iterable[PipeSegment], circuits: Iterable[LiveCircuit],
-) -> None:
-    names: set[str] = set()
+@dataclass(frozen=True)
+class BoundsCircuit:
+    observation_id: str
+    active: Collection[str]
+    lower: Fraction | int | str
+    upper: Fraction | int | str
+
+
+def validate_segments(segments: Iterable[PipeSegment]) -> dict[str, PipeSegment]:
+    names: dict[str, PipeSegment] = {}
     for segment in segments:
         if not isinstance(segment, PipeSegment):
             raise ValueError('segments must be PipeSegment records')
@@ -31,7 +37,26 @@ def validate_circuits(
         require_name(segment.right, 'right endpoint')
         if name in names:
             raise ValueError(f'duplicate segment name {name!r}')
-        names.add(name)
+        names[name] = segment
+    return names
+
+
+def validate_active(observation_id: str, active: object, names: Collection[str]) -> tuple[str, ...]:
+    if not isinstance(active, (tuple, list, set, frozenset)):
+        raise ValueError('active segments must be a collection of names')
+    checked = tuple(require_name(name, 'active segment') for name in active)
+    if len(set(checked)) != len(checked):
+        raise ValueError(f'duplicate active segment in observation {observation_id!r}')
+    unknown = set(checked) - set(names)
+    if unknown:
+        raise ValueError(f'unknown active segments in {observation_id!r}: {sorted(unknown)}')
+    return tuple(sorted(checked))
+
+
+def validate_circuits(
+    segments: Iterable[PipeSegment], circuits: Iterable[LiveCircuit],
+) -> None:
+    names = validate_segments(segments)
 
     observations: set[str] = set()
     for circuit in circuits:
@@ -41,14 +66,7 @@ def validate_circuits(
         if observation_id in observations:
             raise ValueError(f'duplicate observation id {observation_id!r}')
         observations.add(observation_id)
-        if not isinstance(circuit.active, (tuple, list, set, frozenset)):
-            raise ValueError('active segments must be a collection of names')
-        active = tuple(require_name(name, 'active segment') for name in circuit.active)
-        if len(set(active)) != len(active):
-            raise ValueError(f'duplicate active segment in observation {observation_id!r}')
-        unknown = set(active) - names
-        if unknown:
-            raise ValueError(f'unknown active segments in {observation_id!r}: {sorted(unknown)}')
+        validate_active(observation_id, circuit.active, names)
 
 
 def live_edges(

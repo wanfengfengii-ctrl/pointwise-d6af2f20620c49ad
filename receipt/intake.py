@@ -1,7 +1,7 @@
 import sqlite3
 
 from catalog.trial_store import load_trial
-from station.exchange import decode_piece
+from station.decode import decode_any
 from .identity import ReceiptRecord, check_replay
 from .validate import validate_piece
 
@@ -18,7 +18,7 @@ def initialize_receipts(center: sqlite3.Connection) -> None:
 
 
 def receive(trials: sqlite3.Connection, center: sqlite3.Connection, payload: str) -> int:
-    piece = decode_piece(payload)
+    piece = decode_any(payload)
     validate_piece(load_trial(trials, piece.round_id), piece)
     with center:
         cursor = center.execute('''
@@ -33,7 +33,7 @@ def receive(trials: sqlite3.Connection, center: sqlite3.Connection, payload: str
             if row is None:
                 raise sqlite3.IntegrityError('station receipt was not stored')
             existing_id, fixed_payload = row
-            existing = ReceiptRecord(existing_id, decode_piece(fixed_payload), fixed_payload)
+            existing = ReceiptRecord(existing_id, decode_any(fixed_payload), fixed_payload)
             receipt_id = check_replay(existing, piece)
     return receipt_id
 
@@ -45,4 +45,4 @@ def load_receipt(center: sqlite3.Connection, receipt_id: int) -> ReceiptRecord:
     if row is None:
         raise LookupError(f'unknown station receipt {receipt_id}')
     payload = row[0]
-    return ReceiptRecord(receipt_id, decode_piece(payload), payload)
+    return ReceiptRecord(receipt_id, decode_any(payload), payload)
